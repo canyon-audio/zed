@@ -23928,7 +23928,9 @@ impl Editor {
                 self.refresh_code_actions(window, cx);
                 self.refresh_single_line_folds(window, cx);
                 self.refresh_outline_symbols_at_cursor(cx);
-
+                let snapshot = self.snapshot(window, cx);
+                self.refresh_matching_bracket_highlights(&snapshot.display_snapshot, cx);
+                self.refresh_sticky_headers(&snapshot.display_snapshot, cx);
                 if self.has_active_edit_prediction() {
                     self.update_visible_edit_prediction(window, cx);
                 }
