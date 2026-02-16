@@ -19852,9 +19852,7 @@ impl Editor {
                 .disjoint_anchor_ranges()
                 .flat_map(|range| multi_buffer_snapshot.buffer_ids_for_range(range))
                 .collect::<HashSet<_>>();
-            for buffer_id in buffer_ids {
-                self.fold_buffer(buffer_id, cx);
-            }
+            self.fold_buffers_batch(buffer_ids, cx);
         }
     }
 
@@ -20040,9 +20038,8 @@ impl Editor {
             self.toggle_fold_multiple_buffers = cx.spawn_in(window, async move |editor, cx| {
                 editor
                     .update_in(cx, |editor, _, cx| {
-                        for buffer_id in editor.buffer.read(cx).excerpt_buffer_ids() {
-                            editor.fold_buffer(buffer_id, cx);
-                        }
+                        let buffer_ids: Vec<_> = editor.buffer.read(cx).excerpt_buffer_ids();
+                        editor.fold_buffers_batch(buffer_ids, cx);
                     })
                     .ok();
             });
@@ -20311,22 +20308,46 @@ impl Editor {
     }
 
     pub fn fold_buffer(&mut self, buffer_id: BufferId, cx: &mut Context<Self>) {
-        if self.buffer().read(cx).is_singleton() || self.is_buffer_folded(buffer_id, cx) {
+        self.fold_buffers_batch([buffer_id], cx);
+    }
+
+    pub fn fold_buffers_batch(
+        &mut self,
+        buffer_ids: impl IntoIterator<Item = BufferId>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.buffer().read(cx).is_singleton() {
             return;
         }
 
-        let folded_excerpts = self.buffer().read(cx).excerpts_for_buffer(buffer_id, cx);
+        let ids_to_fold: Vec<BufferId> = buffer_ids
+            .into_iter()
+            .filter(|id| !self.is_buffer_folded(*id, cx))
+            .collect();
+
+        if ids_to_fold.is_empty() {
+            return;
+        }
+
+        let mut all_folded_excerpt_ids = Vec::new();
+        for buffer_id in &ids_to_fold {
+            let folded_excerpts = self.buffer().read(cx).excerpts_for_buffer(*buffer_id, cx);
+            all_folded_excerpt_ids.extend(folded_excerpts.iter().map(|&(id, _)| id));
+        }
+
         self.display_map.update(cx, |display_map, cx| {
-            display_map.fold_buffers([buffer_id], cx)
+            display_map.fold_buffers(ids_to_fold.iter().copied(), cx)
         });
 
         let snapshot = self.display_snapshot(cx);
         self.selections.change_with(&snapshot, |selections| {
-            selections.remove_selections_from_buffer(buffer_id);
+            for buffer_id in &ids_to_fold {
+                selections.remove_selections_from_buffer(*buffer_id);
+            }
         });
 
         cx.emit(EditorEvent::BufferFoldToggled {
-            ids: folded_excerpts.iter().map(|&(id, _)| id).collect(),
+            ids: all_folded_excerpt_ids,
             folded: true,
         });
         cx.notify();

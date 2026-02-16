@@ -37,6 +37,7 @@ use settings::{Settings, SettingsStore};
 use smol::future::yield_now;
 use std::any::{Any, TypeId};
 use std::sync::Arc;
+use std::time::Duration;
 use theme::ActiveTheme;
 use ui::{KeyBinding, Tooltip, prelude::*, vertical_divider};
 use util::{ResultExt as _, rel_path::RelPath};
@@ -73,6 +74,8 @@ pub struct ProjectDiff {
     focus_handle: FocusHandle,
     pending_scroll: Option<PathKey>,
     review_comment_count: usize,
+    is_scrolling: bool,
+    _scroll_debounce_task: Option<Task<()>>,
     _task: Task<Result<()>>,
     _subscription: Subscription,
 }
@@ -397,6 +400,8 @@ impl ProjectDiff {
             buffer_diff_subscriptions: Default::default(),
             pending_scroll: None,
             review_comment_count: 0,
+            is_scrolling: false,
+            _scroll_debounce_task: None,
             _task: task,
             _subscription: Subscription::join(
                 branch_diff_subscription,
@@ -591,6 +596,17 @@ impl ProjectDiff {
                     Self::refresh(this, RefreshReason::EditorSaved, cx).await
                 });
             }
+            EditorEvent::ScrollPositionChanged { local: true, .. } => {
+                self.is_scrolling = true;
+                self._scroll_debounce_task = Some(cx.spawn(async move |this, cx| {
+                    const SCROLL_DEBOUNCE: Duration = Duration::from_millis(150);
+                    cx.background_executor().timer(SCROLL_DEBOUNCE).await;
+                    this.update(cx, |this, _cx| {
+                        this.is_scrolling = false;
+                    })
+                    .ok();
+                }));
+            }
             _ => {}
         }
         if editor.focus_handle(cx).contains_focused(window, cx)
@@ -609,7 +625,7 @@ impl ProjectDiff {
         diff: Entity<BufferDiff>,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Option<language::BufferId> {
         let subscription = cx.subscribe_in(&diff, window, move |this, _, _, window, cx| {
             this._task = window.spawn(cx, {
                 let this = cx.weak_entity();
@@ -654,6 +670,8 @@ impl ProjectDiff {
             }
         };
 
+        let mut needs_fold = None;
+
         let (was_empty, is_excerpt_newly_added) = self.editor.update(cx, |editor, cx| {
             let was_empty = editor.rhs_editor().read(cx).buffer().read(cx).is_empty();
             let (_, is_newly_added) = editor.set_excerpts_for_path(
@@ -686,7 +704,7 @@ impl ProjectDiff {
                         || (file_status.is_untracked()
                             && GitPanelSettings::get_global(cx).collapse_untracked_diff))
                 {
-                    editor.fold_buffer(snapshot.text.remote_id(), cx)
+                    needs_fold = Some(snapshot.text.remote_id());
                 }
             })
         });
@@ -707,6 +725,8 @@ impl ProjectDiff {
         if self.pending_scroll.as_ref() == Some(&path_key) {
             self.move_to_path(path_key, window, cx);
         }
+
+        needs_fold
     }
 
     #[instrument(skip_all)]
@@ -762,11 +782,24 @@ impl ProjectDiff {
             buffers_to_load
         })?;
 
+        let mut buffers_to_fold = Vec::new();
+
         for (entry, path_key) in buffers_to_load.into_iter().zip(path_keys.into_iter()) {
             if let Some((buffer, diff)) = entry.load.await.log_err() {
                 // We might be lagging behind enough that all future entry.load futures are no longer pending.
                 // If that is the case, this task will never yield, starving the foreground thread of execution time.
                 yield_now().await;
+
+                // Pause while the user is actively scrolling to avoid invalidating
+                // the display map mid-scroll, which causes expensive snapshot syncs.
+                const SCROLL_POLL_INTERVAL: Duration = Duration::from_millis(50);
+                loop {
+                    let is_scrolling = this.update(cx, |this, _cx| this.is_scrolling)?;
+                    if !is_scrolling {
+                        break;
+                    }
+                    cx.background_executor().timer(SCROLL_POLL_INTERVAL).await;
+                }
                 cx.update(|window, cx| {
                     this.update(cx, |this, cx| {
                         let multibuffer = this.multibuffer.read(cx);
@@ -781,14 +814,16 @@ impl ProjectDiff {
                                 RefreshReason::StatusesChanged => false,
                             };
                         if !skip {
-                            this.register_buffer(
+                            if let Some(buffer_id) = this.register_buffer(
                                 path_key,
                                 entry.file_status,
                                 buffer,
                                 diff,
                                 window,
                                 cx,
-                            )
+                            ) {
+                                buffers_to_fold.push(buffer_id);
+                            }
                         }
                     })
                     .ok();
@@ -796,6 +831,13 @@ impl ProjectDiff {
             }
         }
         this.update(cx, |this, cx| {
+            if !buffers_to_fold.is_empty() {
+                this.editor.update(cx, |editor, cx| {
+                    editor.rhs_editor().update(cx, |editor, cx| {
+                        editor.fold_buffers_batch(buffers_to_fold, cx)
+                    });
+                });
+            }
             this.pending_scroll.take();
             cx.notify();
         })?;
