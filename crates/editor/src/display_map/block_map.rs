@@ -782,6 +782,9 @@ impl BlockMap {
             ..
         }) = companion_view
         {
+            let span = ztracing::debug_span!("companion edits");
+            let _enter = span.enter();
+
             let mut companion_edits_in_my_space: Vec<WrapEdit> = companion_edits
                 .clone()
                 .into_inner()

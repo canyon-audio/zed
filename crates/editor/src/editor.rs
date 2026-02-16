@@ -1983,6 +1983,7 @@ impl Editor {
         Editor::new_internal(mode, buffer, project, None, window, cx)
     }
 
+    #[ztracing::instrument(skip_all)]
     pub fn refresh_sticky_headers(
         &mut self,
         display_snapshot: &DisplaySnapshot,
