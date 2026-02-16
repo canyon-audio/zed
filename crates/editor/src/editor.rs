@@ -3626,7 +3626,7 @@ impl Editor {
             refresh_linked_ranges(self, window, cx);
 
             self.refresh_selected_text_highlights(false, window, cx);
-            self.refresh_matching_bracket_highlights(window, cx);
+            self.refresh_matching_bracket_highlights(&display_map, cx);
             self.refresh_outline_symbols_at_cursor(cx);
             self.update_visible_edit_prediction(window, cx);
             self.edit_prediction_requires_modifier_in_indent_conflict = true;
@@ -23906,9 +23906,8 @@ impl Editor {
                 self.refresh_active_diagnostics(cx);
                 self.refresh_code_actions(window, cx);
                 self.refresh_single_line_folds(window, cx);
-                self.refresh_matching_bracket_highlights(window, cx);
                 self.refresh_outline_symbols_at_cursor(cx);
-                self.refresh_sticky_headers(&self.snapshot(window, cx), cx);
+
                 if self.has_active_edit_prediction() {
                     self.update_visible_edit_prediction(window, cx);
                 }
