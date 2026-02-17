@@ -473,13 +473,18 @@ pub struct GitSettings {
     ///
     /// Default: file_name_first
     pub path_style: Option<GitPathStyle>,
-    /// Directory where agent worktrees are created.
-    /// If not set, defaults to the Zed data directory.
+    /// Directory where git worktrees are created, relative to the repository
+    /// working directory.
     ///
-    /// Can be an absolute path or relative to the project root.
+    /// Examples:
+    /// - `"../worktrees"` — sibling of the project root (default)
+    /// - `".git/zed-worktrees"` — inside the git directory
+    /// - `"my-worktrees"` — subdirectory of the project root
     ///
-    /// Default: null (uses system default)
-    pub agent_worktree_directory: Option<String>,
+    /// Trailing slashes are ignored.
+    ///
+    /// Default: ../worktrees
+    pub worktree_directory: Option<String>,
 }
 
 #[with_fallible_options]

@@ -762,9 +762,7 @@ mod tests {
         );
         thread.git_worktree_info = Some(AgentGitWorktreeInfo {
             branch: "zed/agent/a4Xiu".to_string(),
-            worktree_path: std::path::PathBuf::from(
-                "/tmp/agent-worktrees/my-project/zed/agent/a4Xiu",
-            ),
+            worktree_path: std::path::PathBuf::from("/repo/worktrees/zed/agent/a4Xiu"),
             base_ref: "main".to_string(),
         });
 
@@ -785,7 +783,7 @@ mod tests {
         assert_eq!(info.branch, "zed/agent/a4Xiu");
         assert_eq!(
             info.worktree_path,
-            std::path::PathBuf::from("/tmp/agent-worktrees/my-project/zed/agent/a4Xiu")
+            std::path::PathBuf::from("/repo/worktrees/zed/agent/a4Xiu")
         );
         assert_eq!(info.base_ref, "main");
     }
@@ -802,7 +800,7 @@ mod tests {
         );
         worktree_thread.git_worktree_info = Some(AgentGitWorktreeInfo {
             branch: "zed/agent/bR9kz".to_string(),
-            worktree_path: std::path::PathBuf::from("/tmp/worktrees/bR9kz"),
+            worktree_path: std::path::PathBuf::from("/repo/worktrees/zed/agent/bR9kz"),
             base_ref: "develop".to_string(),
         });
 

@@ -299,6 +299,7 @@ enum GraphCommitHandlerState {
 pub struct Repository {
     this: WeakEntity<Self>,
     snapshot: RepositorySnapshot,
+    dot_git_abs_path: Option<Arc<Path>>,
     commit_message_buffer: Option<Entity<Buffer>>,
     git_store: WeakEntity<GitStore>,
     // For a local repository, holds paths that have had worktree events since the last status scan completed,
@@ -2285,13 +2286,13 @@ impl GitStore {
     ) -> Result<proto::Ack> {
         let repository_id = RepositoryId::from_proto(envelope.payload.repository_id);
         let repository_handle = Self::repository_for_request(&this, repository_id, &mut cx)?;
-        let directory = PathBuf::from(envelope.payload.directory);
         let name = envelope.payload.name;
+        let worktree_directory = envelope.payload.directory;
         let commit = envelope.payload.commit;
 
         repository_handle
             .update(&mut cx, |repository_handle, _| {
-                repository_handle.create_worktree(name, directory, commit)
+                repository_handle.create_worktree(name, worktree_directory, commit)
             })
             .await??;
 
@@ -3685,6 +3686,10 @@ impl MergeDetails {
 }
 
 impl Repository {
+    pub fn dot_git_abs_path(&self) -> Option<&Arc<Path>> {
+        self.dot_git_abs_path.as_ref()
+    }
+
     pub fn snapshot(&self) -> RepositorySnapshot {
         self.snapshot.clone()
     }
@@ -3714,6 +3719,7 @@ impl Repository {
     ) -> Self {
         let snapshot =
             RepositorySnapshot::empty(id, work_directory_abs_path.clone(), PathStyle::local());
+        let stored_dot_git_abs_path = Some(dot_git_abs_path.clone());
         let state = cx
             .spawn(async move |_, cx| {
                 LocalRepositoryState::new(
@@ -3747,6 +3753,7 @@ impl Repository {
             this: cx.weak_entity(),
             git_store,
             snapshot,
+            dot_git_abs_path: stored_dot_git_abs_path,
             pending_ops: Default::default(),
             repository_state: state,
             commit_message_buffer: None,
@@ -3778,6 +3785,7 @@ impl Repository {
         Self {
             this: cx.weak_entity(),
             snapshot,
+            dot_git_abs_path: None,
             commit_message_buffer: None,
             git_store,
             pending_ops: Default::default(),
@@ -5532,7 +5540,7 @@ impl Repository {
     pub fn create_worktree(
         &mut self,
         name: String,
-        path: PathBuf,
+        worktree_directory: String,
         commit: Option<String>,
     ) -> oneshot::Receiver<Result<()>> {
         let id = self.id;
@@ -5541,7 +5549,9 @@ impl Repository {
             move |repo, _cx| async move {
                 match repo {
                     RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
-                        backend.create_worktree(name, path, commit).await
+                        backend
+                            .create_worktree(name, worktree_directory.clone(), commit)
+                            .await
                     }
                     RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
                         client
@@ -5549,7 +5559,7 @@ impl Repository {
                                 project_id: project_id.0,
                                 repository_id: id.to_proto(),
                                 name,
-                                directory: path.to_string_lossy().to_string(),
+                                directory: worktree_directory,
                                 commit,
                             })
                             .await?;

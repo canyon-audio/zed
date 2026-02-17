@@ -454,9 +454,11 @@ pub struct GitSettings {
     ///
     /// Default: file_name_first
     pub path_style: GitPathStyle,
-    /// Directory where agent worktrees are created.
-    /// If not set, defaults to the Zed data directory.
-    pub agent_worktree_directory: Option<String>,
+    /// Directory where git worktrees are created, relative to the repository
+    /// working directory.
+    ///
+    /// Default: ../worktrees
+    pub worktree_directory: String,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -646,7 +648,10 @@ impl Settings for ProjectSettings {
             },
             hunk_style: git.hunk_style.unwrap(),
             path_style: git.path_style.unwrap().into(),
-            agent_worktree_directory: git.agent_worktree_directory.clone(),
+            worktree_directory: git
+                .worktree_directory
+                .clone()
+                .unwrap_or_else(|| "../worktrees".to_string()),
         };
         Self {
             context_servers: project
