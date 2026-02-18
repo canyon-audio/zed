@@ -635,6 +635,9 @@ fn main() {
             cx,
         );
 
+        #[cfg(feature = "remote-control")]
+        zed_remote_control::init(cx);
+
         repl::init(app_state.fs.clone(), cx);
         recent_projects::init(cx);
         dev_container::init(cx);

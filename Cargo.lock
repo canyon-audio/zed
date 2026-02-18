@@ -21276,6 +21276,7 @@ dependencies = [
  "zed-reqwest",
  "zed_actions",
  "zed_env_vars",
+ "zed_remote_control",
  "zlog",
  "zlog_settings",
  "ztracing",
@@ -21456,6 +21457,27 @@ name = "zed_proto"
 version = "0.3.1"
 dependencies = [
  "zed_extension_api 0.7.0",
+]
+
+[[package]]
+name = "zed_remote_control"
+version = "0.1.0"
+dependencies = [
+ "acp_thread",
+ "agent-client-protocol",
+ "agent_ui",
+ "anyhow",
+ "futures 0.3.31",
+ "gpui",
+ "gpui_tokio",
+ "log",
+ "project",
+ "serde",
+ "serde_json",
+ "smol",
+ "tokio",
+ "tokio-tungstenite 0.26.2",
+ "workspace",
 ]
 
 [[package]]

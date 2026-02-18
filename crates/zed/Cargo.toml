@@ -13,6 +13,7 @@ workspace = true
 
 [features]
 tracy = ["ztracing/tracy"]
+remote-control = ["dep:zed_remote_control"]
 test-support = [
     "gpui/test-support",
     "gpui/screen-capture",
@@ -225,6 +226,7 @@ which_key.workspace = true
 workspace.workspace = true
 zed_actions.workspace = true
 zed_env_vars.workspace = true
+zed_remote_control = { workspace = true, optional = true }
 zlog.workspace = true
 zlog_settings.workspace = true
 

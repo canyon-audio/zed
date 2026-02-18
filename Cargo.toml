@@ -212,6 +212,7 @@ members = [
     "crates/zed",
     "crates/zed_actions",
     "crates/zed_env_vars",
+    "crates/zed_remote_control",
     "crates/edit_prediction_cli",
     "crates/zeta_prompt",
     "crates/zlog",
@@ -450,6 +451,7 @@ x_ai = { path = "crates/x_ai" }
 zed = { path = "crates/zed" }
 zed_actions = { path = "crates/zed_actions" }
 zed_env_vars = { path = "crates/zed_env_vars" }
+zed_remote_control = { path = "crates/zed_remote_control" }
 edit_prediction = { path = "crates/edit_prediction" }
 zeta_prompt = { path = "crates/zeta_prompt" }
 zlog = { path = "crates/zlog" }
