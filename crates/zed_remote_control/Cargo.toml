@@ -25,6 +25,7 @@ credentials_provider.workspace = true
 futures.workspace = true
 gpui.workspace = true
 gpui_tokio.workspace = true
+http_client_tls.workspace = true
 log.workspace = true
 project.workspace = true
 rand.workspace = true

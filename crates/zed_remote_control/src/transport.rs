@@ -7,7 +7,7 @@ use futures::{SinkExt, StreamExt};
 use gpui::AppContext;
 use gpui_tokio::Tokio;
 use tokio::sync::watch;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::{connect_async_tls_with_config, tungstenite::Message, Connector};
 use x25519_dalek::PublicKey;
 
 /// Current pairing status, observable by UI.
@@ -108,7 +108,14 @@ async fn run_connection_loop(
         let _ = status_tx.send(PairingStatus::Connecting);
         log::info!("zrc: connecting to relay at {url}");
 
-        match connect_async(&url).await {
+        let tls_connector = if url.starts_with("wss://") {
+            let tls_config = http_client_tls::tls_config();
+            Some(Connector::Rustls(std::sync::Arc::new(tls_config)))
+        } else {
+            None
+        };
+
+        match connect_async_tls_with_config(&url, None, false, tls_connector).await {
             Ok((ws_stream, _)) => {
                 log::info!("zrc: connected to relay");
                 let (mut ws_sink, mut ws_source) = ws_stream.split();
@@ -147,6 +154,36 @@ async fn run_connection_loop(
                 } else {
                     let keys = session_keys.as_ref().unwrap();
                     log::info!("zrc: reconnecting with stored pairing {}", keys.pairing_id);
+
+                    // Check for pairing.expired from server (brief peek)
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        ws_source.next(),
+                    )
+                    .await
+                    {
+                        Ok(Some(Ok(Message::Text(text)))) => {
+                            if let Ok(val) =
+                                serde_json::from_str::<serde_json::Value>(&text)
+                            {
+                                if val.get("type").and_then(|t| t.as_str())
+                                    == Some("pairing.expired")
+                                {
+                                    log::warn!("zrc: stored pairing expired, clearing credentials");
+                                    session_keys = None;
+                                    continue;
+                                }
+                            }
+                            // Not an expired message — unexpected, proceed anyway
+                        }
+                        Ok(Some(Ok(_))) | Ok(None) | Ok(Some(Err(_))) => {
+                            // Connection closed or unexpected frame — will be caught in encrypted loop
+                        }
+                        Err(_) => {
+                            // Timeout — no pairing.expired, reconnect is OK
+                        }
+                    }
+
                     let _ = status_tx.send(PairingStatus::Paired {
                         pairing_id: keys.pairing_id.clone(),
                         peer_online: false,
