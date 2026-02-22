@@ -27,6 +27,8 @@ pub enum PairingStatus {
 pub struct StoredCredentials {
     pub pairing_id: String,
     pub symmetric_key_b64: String,
+    #[serde(default)]
+    pub reconnect_token: Option<String>,
 }
 
 /// Manages the WebSocket connection to the ZRC relay server with E2E encryption.
@@ -39,6 +41,8 @@ pub struct RelayTransport {
     pub status_rx: watch::Receiver<PairingStatus>,
     /// Channel to receive credentials that should be saved to keychain.
     pub credential_save_rx: mpsc::UnboundedReceiver<StoredCredentials>,
+    /// Channel signaling that stale credentials should be deleted from keychain.
+    pub credential_delete_rx: mpsc::UnboundedReceiver<()>,
     /// Notified when the mobile peer (re)connects, so tap can resync thread state.
     pub peer_connected_rx: mpsc::UnboundedReceiver<()>,
 }
@@ -54,6 +58,7 @@ impl RelayTransport {
         let (command_tx, command_rx) = mpsc::unbounded::<RelayCommand>();
         let (status_tx, status_rx) = watch::channel(PairingStatus::Disconnected);
         let (cred_save_tx, cred_save_rx) = mpsc::unbounded::<StoredCredentials>();
+        let (cred_delete_tx, cred_delete_rx) = mpsc::unbounded::<()>();
         let (peer_connected_tx, peer_connected_rx) = mpsc::unbounded::<()>();
 
         let url = url.to_string();
@@ -69,6 +74,7 @@ impl RelayTransport {
                 command_tx,
                 status_tx,
                 cred_save_tx,
+                cred_delete_tx,
                 peer_connected_tx,
             ),
         )
@@ -79,6 +85,7 @@ impl RelayTransport {
             command_rx,
             status_rx,
             credential_save_rx: cred_save_rx,
+            credential_delete_rx: cred_delete_rx,
             peer_connected_rx,
         })
     }
@@ -92,8 +99,13 @@ async fn run_connection_loop(
     mut command_tx: mpsc::UnboundedSender<RelayCommand>,
     status_tx: watch::Sender<PairingStatus>,
     mut cred_save_tx: mpsc::UnboundedSender<StoredCredentials>,
+    cred_delete_tx: mpsc::UnboundedSender<()>,
     peer_connected_tx: mpsc::UnboundedSender<()>,
 ) {
+    let mut reconnect_token: Option<String> = stored_credentials
+        .as_ref()
+        .and_then(|c| c.reconnect_token.clone());
+
     let mut session_keys: Option<SessionKeys> = stored_credentials.and_then(|creds| {
         let key_bytes = B64.decode(&creds.symmetric_key_b64).ok()?;
         if key_bytes.len() != 32 {
@@ -120,24 +132,29 @@ async fn run_connection_loop(
                 log::info!("zrc: connected to relay");
                 let (mut ws_sink, mut ws_source) = ws_stream.split();
 
-                // Phase 1: Handshake
+                // Phase 1: Handshake (include reconnect_token if we have one)
                 let handshake = ClientHandshake::new_zed(
                     &client_id,
                     session_keys.as_ref().map(|k| k.pairing_id.as_str()),
+                    reconnect_token.as_deref(),
                 );
                 if send_json(&mut ws_sink, &handshake).await.is_err() {
                     continue;
                 }
 
                 // Phase 2: Pairing or Reconnect
+                let mut peeked_message: Option<String> = None;
+
                 if session_keys.is_none() {
                     match run_pairing(&mut ws_sink, &mut ws_source, &status_tx).await {
-                        Ok(keys) => {
+                        Ok((keys, token)) => {
+                            reconnect_token = token;
                             // Save credentials for reconnection
                             let _ = cred_save_tx
                                 .send(StoredCredentials {
                                     pairing_id: keys.pairing_id.clone(),
                                     symmetric_key_b64: B64.encode(keys.symmetric_key),
+                                    reconnect_token: reconnect_token.clone(),
                                 })
                                 .await;
                             session_keys = Some(keys);
@@ -155,7 +172,7 @@ async fn run_connection_loop(
                     let keys = session_keys.as_ref().unwrap();
                     log::info!("zrc: reconnecting with stored pairing {}", keys.pairing_id);
 
-                    // Check for pairing.expired from server (brief peek)
+                    // Brief peek for pairing.expired; preserve any other message
                     match tokio::time::timeout(
                         std::time::Duration::from_secs(2),
                         ws_source.next(),
@@ -163,18 +180,19 @@ async fn run_connection_loop(
                     .await
                     {
                         Ok(Some(Ok(Message::Text(text)))) => {
-                            if let Ok(val) =
-                                serde_json::from_str::<serde_json::Value>(&text)
-                            {
-                                if val.get("type").and_then(|t| t.as_str())
-                                    == Some("pairing.expired")
-                                {
+                            match RelayMessage::parse(&text) {
+                                Ok(RelayMessage::PairingExpired { .. }) => {
                                     log::warn!("zrc: stored pairing expired, clearing credentials");
                                     session_keys = None;
+                                    reconnect_token = None;
+                                    let _ = cred_delete_tx.unbounded_send(());
                                     continue;
                                 }
+                                _ => {
+                                    // Not expired — preserve for the encrypted loop
+                                    peeked_message = Some(text.to_string());
+                                }
                             }
-                            // Not an expired message — unexpected, proceed anyway
                         }
                         Ok(Some(Ok(_))) | Ok(None) | Ok(Some(Err(_))) => {
                             // Connection closed or unexpected frame — will be caught in encrypted loop
@@ -197,6 +215,7 @@ async fn run_connection_loop(
                     keys,
                     &mut ws_sink,
                     &mut ws_source,
+                    peeked_message,
                     &mut event_rx,
                     &mut command_tx,
                     &status_tx,
@@ -211,6 +230,8 @@ async fn run_connection_loop(
                 if start.elapsed().as_secs() < 5 {
                     log::warn!("zrc: connection dropped quickly — clearing stored credentials for re-pairing");
                     session_keys = None;
+                    reconnect_token = None;
+                    let _ = cred_delete_tx.unbounded_send(());
                 }
             }
             Err(e) => {
@@ -226,12 +247,12 @@ async fn run_connection_loop(
     }
 }
 
-/// Run the pairing ceremony. Returns SessionKeys on success.
+/// Run the pairing ceremony. Returns (SessionKeys, reconnect_token) on success.
 async fn run_pairing<S, R>(
     ws_sink: &mut S,
     ws_source: &mut R,
     status_tx: &watch::Sender<PairingStatus>,
-) -> Result<SessionKeys>
+) -> Result<(SessionKeys, Option<String>)>
 where
     S: futures::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
     R: futures::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
@@ -240,10 +261,10 @@ where
     send_json(ws_sink, &PairingInit::default()).await?;
 
     // 2. Wait for PairingInitResult
-    let (pairing_id, join_code) = loop {
+    let (pairing_id, join_code, init_reconnect_token) = loop {
         match recv_relay_message(ws_source).await? {
             RelayMessage::PairingInitResult(result) => {
-                break (result.pairing_id, result.join_code);
+                break (result.pairing_id, result.join_code, result.reconnect_token);
             }
             _ => {}
         }
@@ -312,7 +333,7 @@ where
         match recv_relay_message(ws_source).await? {
             RelayMessage::PairingComplete(_) => {
                 log::info!("zrc: pairing complete! pairing_id={pairing_id}");
-                return Ok(SessionKeys::new(pairing_id, symmetric_key));
+                return Ok((SessionKeys::new(pairing_id, symmetric_key), init_reconnect_token));
             }
             RelayMessage::PairingReject(reject) => {
                 return Err(anyhow::anyhow!("pairing rejected: {}", reject.reason));
@@ -327,6 +348,7 @@ async fn run_encrypted_loop<S, R>(
     keys: &mut SessionKeys,
     ws_sink: &mut S,
     ws_source: &mut R,
+    first_message: Option<String>,
     event_rx: &mut mpsc::UnboundedReceiver<TapEvent>,
     command_tx: &mut mpsc::UnboundedSender<RelayCommand>,
     status_tx: &watch::Sender<PairingStatus>,
@@ -340,69 +362,23 @@ async fn run_encrypted_loop<S, R>(
         peer_online: false,
     });
 
+    // Process any message that was peeked during reconnect
+    if let Some(text) = first_message {
+        if handle_inbound_text(&text, keys, command_tx, status_tx, peer_connected_tx)
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+
     loop {
         tokio::select! {
             msg = recv_text(ws_source) => {
                 match msg {
                     Ok(Some(text)) => {
-                        match RelayMessage::parse(&text) {
-                            Ok(RelayMessage::Encrypted(env)) => {
-                                let aad = crypto::build_aad(&env.pairing_id, &env.sender, env.sequence);
-                                match crypto::decrypt(&env.nonce, &env.ciphertext, &keys.symmetric_key, &aad) {
-                                    Ok(plaintext) => {
-                                        match serde_json::from_str::<RelayCommand>(&plaintext) {
-                                            Ok(cmd) => {
-                                                if command_tx.send(cmd).await.is_err() {
-                                                    return;
-                                                }
-                                            }
-                                            Err(e) => {
-                                                log::warn!("zrc: failed to parse decrypted command: {e}");
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        log::warn!("zrc: decryption failed: {e}");
-                                    }
-                                }
-                            }
-                            Ok(RelayMessage::PeerConnected(pc)) => {
-                                log::info!("zrc: peer connected: {}", pc.peer_type);
-                                let _ = status_tx.send(PairingStatus::Paired {
-                                    pairing_id: keys.pairing_id.clone(),
-                                    peer_online: true,
-                                });
-                                // Signal tap layer to resync thread state
-                                let _ = peer_connected_tx.unbounded_send(());
-                            }
-                            Ok(RelayMessage::PeerDisconnected(pd)) => {
-                                log::info!("zrc: peer disconnected: {}", pd.peer_type);
-                                let _ = status_tx.send(PairingStatus::Paired {
-                                    pairing_id: keys.pairing_id.clone(),
-                                    peer_online: false,
-                                });
-                            }
-                            Ok(RelayMessage::ReplayResponse(rr)) => {
-                                log::info!("zrc: replay response with {} messages", rr.messages.len());
-                                for msg_val in &rr.messages {
-                                    if let Ok(env) = serde_json::from_value::<EncryptedEnvelope>(msg_val.clone()) {
-                                        let aad = crypto::build_aad(&env.pairing_id, &env.sender, env.sequence);
-                                        if let Ok(pt) = crypto::decrypt(&env.nonce, &env.ciphertext, &keys.symmetric_key, &aad) {
-                                            if let Ok(cmd) = serde_json::from_str::<RelayCommand>(&pt) {
-                                                if command_tx.send(cmd).await.is_err() {
-                                                    return;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            Ok(other) => {
-                                log::debug!("zrc: ignoring relay message: {other:?}");
-                            }
-                            Err(e) => {
-                                log::warn!("zrc: failed to parse relay message: {e}");
-                            }
+                        if handle_inbound_text(&text, keys, command_tx, status_tx, peer_connected_tx).await.is_err() {
+                            return;
                         }
                     }
                     Ok(None) => break,
@@ -444,6 +420,79 @@ async fn run_encrypted_loop<S, R>(
             }
         }
     }
+}
+
+/// Handle a single inbound text message from the relay.
+/// Returns Err(()) if the command channel is closed and the loop should exit.
+async fn handle_inbound_text(
+    text: &str,
+    keys: &mut SessionKeys,
+    command_tx: &mut mpsc::UnboundedSender<RelayCommand>,
+    status_tx: &watch::Sender<PairingStatus>,
+    peer_connected_tx: &mpsc::UnboundedSender<()>,
+) -> Result<(), ()> {
+    match RelayMessage::parse(text) {
+        Ok(RelayMessage::Encrypted(env)) => {
+            let aad = crypto::build_aad(&env.pairing_id, &env.sender, env.sequence);
+            match crypto::decrypt(&env.nonce, &env.ciphertext, &keys.symmetric_key, &aad) {
+                Ok(plaintext) => {
+                    match serde_json::from_str::<RelayCommand>(&plaintext) {
+                        Ok(cmd) => {
+                            if command_tx.send(cmd).await.is_err() {
+                                return Err(());
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!("zrc: failed to parse decrypted command: {e}");
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::warn!("zrc: decryption failed: {e}");
+                }
+            }
+        }
+        Ok(RelayMessage::PeerConnected(pc)) => {
+            log::info!("zrc: peer connected: {}", pc.peer_type);
+            let _ = status_tx.send(PairingStatus::Paired {
+                pairing_id: keys.pairing_id.clone(),
+                peer_online: true,
+            });
+            // Signal tap layer to resync thread state
+            let _ = peer_connected_tx.unbounded_send(());
+        }
+        Ok(RelayMessage::PeerDisconnected(pd)) => {
+            log::info!("zrc: peer disconnected: {}", pd.peer_type);
+            let _ = status_tx.send(PairingStatus::Paired {
+                pairing_id: keys.pairing_id.clone(),
+                peer_online: false,
+            });
+        }
+        Ok(RelayMessage::ReplayResponse(rr)) => {
+            log::info!("zrc: replay response with {} messages", rr.messages.len());
+            for msg_val in &rr.messages {
+                if let Ok(env) = serde_json::from_value::<EncryptedEnvelope>(msg_val.clone()) {
+                    let aad = crypto::build_aad(&env.pairing_id, &env.sender, env.sequence);
+                    if let Ok(pt) =
+                        crypto::decrypt(&env.nonce, &env.ciphertext, &keys.symmetric_key, &aad)
+                    {
+                        if let Ok(cmd) = serde_json::from_str::<RelayCommand>(&pt) {
+                            if command_tx.send(cmd).await.is_err() {
+                                return Err(());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(other) => {
+            log::debug!("zrc: ignoring relay message: {other:?}");
+        }
+        Err(e) => {
+            log::warn!("zrc: failed to parse relay message: {e}");
+        }
+    }
+    Ok(())
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────

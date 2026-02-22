@@ -106,15 +106,22 @@ pub struct ClientHandshake {
     pub client_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pairing_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reconnect_token: Option<String>,
 }
 
 impl ClientHandshake {
-    pub fn new_zed(client_id: &str, pairing_id: Option<&str>) -> Self {
+    pub fn new_zed(
+        client_id: &str,
+        pairing_id: Option<&str>,
+        reconnect_token: Option<&str>,
+    ) -> Self {
         Self {
             msg_type: "handshake".into(),
             client_type: "zed".into(),
             client_id: client_id.into(),
             pairing_id: pairing_id.map(Into::into),
+            reconnect_token: reconnect_token.map(Into::into),
         }
     }
 }
@@ -141,6 +148,8 @@ pub struct PairingInitResult {
     pub msg_type: String,
     pub pairing_id: String,
     pub join_code: String,
+    #[serde(default)]
+    pub reconnect_token: Option<String>,
 }
 
 /// Both sides send their X25519 public key via the relay.
@@ -292,6 +301,7 @@ pub enum RelayMessage {
     PeerDisconnected(PeerDisconnected),
     Encrypted(EncryptedEnvelope),
     ReplayResponse(ReplayResponse),
+    PairingExpired { pairing_id: String },
     Unknown(String),
 }
 
@@ -308,6 +318,13 @@ impl RelayMessage {
             "peer.disconnected" => Ok(Self::PeerDisconnected(serde_json::from_value(v)?)),
             "encrypted" => Ok(Self::Encrypted(serde_json::from_value(v)?)),
             "replay.response" => Ok(Self::ReplayResponse(serde_json::from_value(v)?)),
+            "pairing.expired" => Ok(Self::PairingExpired {
+                pairing_id: v
+                    .get("pairing_id")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            }),
             other => Ok(Self::Unknown(other.to_string())),
         }
     }
@@ -384,7 +401,7 @@ mod tests {
 
     #[test]
     fn test_serialize_client_handshake() {
-        let hs = ClientHandshake::new_zed("client-123", None);
+        let hs = ClientHandshake::new_zed("client-123", None, None);
         let json = serde_json::to_string(&hs).unwrap();
         assert!(json.contains(r#""type":"handshake""#));
         assert!(json.contains(r#""client_type":"zed""#));
@@ -394,7 +411,7 @@ mod tests {
 
     #[test]
     fn test_serialize_client_handshake_with_pairing_id() {
-        let hs = ClientHandshake::new_zed("client-123", Some("pid-456"));
+        let hs = ClientHandshake::new_zed("client-123", Some("pid-456"), None);
         let json = serde_json::to_string(&hs).unwrap();
         assert!(json.contains(r#""pairing_id":"pid-456""#));
     }
@@ -563,6 +580,60 @@ mod tests {
         match msg {
             RelayMessage::Unknown(t) => assert_eq!(t, ""),
             _ => panic!("should be Unknown"),
+        }
+    }
+
+    #[test]
+    fn test_parse_pairing_expired() {
+        let json = r#"{"type":"pairing.expired","pairing_id":"pid-1"}"#;
+        let msg = RelayMessage::parse(json).unwrap();
+        match msg {
+            RelayMessage::PairingExpired { pairing_id } => {
+                assert_eq!(pairing_id, "pid-1");
+            }
+            _ => panic!("expected PairingExpired"),
+        }
+    }
+
+    #[test]
+    fn test_serialize_client_handshake_with_reconnect_token() {
+        let hs = ClientHandshake::new_zed("client-123", Some("pid-456"), Some("tok-abc"));
+        let json = serde_json::to_string(&hs).unwrap();
+        assert!(json.contains(r#""reconnect_token":"tok-abc""#));
+        assert!(json.contains(r#""pairing_id":"pid-456""#));
+    }
+
+    #[test]
+    fn test_serialize_client_handshake_no_reconnect_token_omitted() {
+        let hs = ClientHandshake::new_zed("client-123", None, None);
+        let json = serde_json::to_string(&hs).unwrap();
+        assert!(!json.contains("reconnect_token"));
+        assert!(!json.contains("pairing_id"));
+    }
+
+    #[test]
+    fn test_parse_pairing_init_result_with_reconnect_token() {
+        let json = r#"{"type":"pairing.init_result","pairing_id":"pid-1","join_code":"ABC123","reconnect_token":"tok-xyz"}"#;
+        let msg = RelayMessage::parse(json).unwrap();
+        match msg {
+            RelayMessage::PairingInitResult(r) => {
+                assert_eq!(r.pairing_id, "pid-1");
+                assert_eq!(r.join_code, "ABC123");
+                assert_eq!(r.reconnect_token, Some("tok-xyz".to_string()));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_parse_pairing_init_result_without_reconnect_token() {
+        let json = r#"{"type":"pairing.init_result","pairing_id":"pid-1","join_code":"ABC123"}"#;
+        let msg = RelayMessage::parse(json).unwrap();
+        match msg {
+            RelayMessage::PairingInitResult(r) => {
+                assert_eq!(r.reconnect_token, None);
+            }
+            _ => panic!("wrong variant"),
         }
     }
 }

@@ -21589,6 +21589,7 @@ dependencies = [
  "futures 0.3.31",
  "gpui",
  "gpui_tokio",
+ "http_client_tls",
  "log",
  "project",
  "rand 0.9.2",

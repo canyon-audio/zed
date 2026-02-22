@@ -50,11 +50,18 @@ async fn load_credentials(cx: &AsyncApp) -> Option<StoredCredentials> {
     let provider = cx.update(|cx| <dyn CredentialsProvider>::global(cx));
     let result = provider.read_credentials(CREDENTIAL_URL, cx).await;
     match result {
-        Ok(Some((pairing_id, key_bytes))) => {
-            log::info!("zrc: loaded stored pairing credentials for {pairing_id}");
+        Ok(Some((pairing_id, bytes))) => {
+            // Try JSON deserialization first (new format with reconnect_token)
+            if let Ok(creds) = serde_json::from_slice::<StoredCredentials>(&bytes) {
+                log::info!("zrc: loaded stored pairing credentials for {}", creds.pairing_id);
+                return Some(creds);
+            }
+            // Fall back: raw key bytes (old format, no reconnect token)
+            log::info!("zrc: loaded stored pairing credentials (legacy format) for {pairing_id}");
             Some(StoredCredentials {
                 pairing_id,
-                symmetric_key_b64: B64.encode(&key_bytes),
+                symmetric_key_b64: B64.encode(&bytes),
+                reconnect_token: None,
             })
         }
         Ok(None) => {
@@ -101,8 +108,9 @@ fn start_transport(relay_url: &str, stored: Option<StoredCredentials>, cx: &mut 
             // Handle peer reconnect — resync current thread state to mobile
             spawn_resync_handler(transport.peer_connected_rx, event_tx.clone(), cx);
 
-            // Handle credential saves
+            // Handle credential saves and deletes
             spawn_credential_saver(transport.credential_save_rx, cx);
+            spawn_credential_deleter(transport.credential_delete_rx, cx);
 
             // Observe all new Workspace instances to find AgentPanels
             let workspaces2 = workspaces.clone();
@@ -141,12 +149,13 @@ fn spawn_credential_saver(
     cx.spawn(async move |cx: &mut AsyncApp| {
         while let Some(creds) = cred_rx.next().await {
             let provider = cx.update(|cx| <dyn CredentialsProvider>::global(cx));
-            let key_bytes = match B64.decode(&creds.symmetric_key_b64) {
-                Ok(b) => b,
+            // Serialize the full StoredCredentials as JSON (includes reconnect_token)
+            let payload = match serde_json::to_vec(&creds) {
+                Ok(p) => p,
                 Err(_) => continue,
             };
             match provider
-                .write_credentials(CREDENTIAL_URL, &creds.pairing_id, &key_bytes, cx)
+                .write_credentials(CREDENTIAL_URL, &creds.pairing_id, &payload, cx)
                 .await
             {
                 Ok(()) => {
@@ -154,6 +163,26 @@ fn spawn_credential_saver(
                 }
                 Err(e) => {
                     log::warn!("zrc: failed to save credentials: {e}");
+                }
+            }
+        }
+    })
+    .detach();
+}
+
+fn spawn_credential_deleter(
+    mut delete_rx: mpsc::UnboundedReceiver<()>,
+    cx: &App,
+) {
+    cx.spawn(async move |cx: &mut AsyncApp| {
+        while delete_rx.next().await.is_some() {
+            let provider = cx.update(|cx| <dyn CredentialsProvider>::global(cx));
+            match provider.delete_credentials(CREDENTIAL_URL, cx).await {
+                Ok(()) => {
+                    log::info!("zrc: deleted stale pairing credentials from keychain");
+                }
+                Err(e) => {
+                    log::warn!("zrc: failed to delete credentials: {e}");
                 }
             }
         }
@@ -461,34 +490,50 @@ fn inject_prompt(project_name: &str, text: &str, cx: &mut AsyncApp) {
         }
     };
 
-    for tw in &workspaces {
-        if tw.project_name != project_name {
-            continue;
-        }
-        if let Some(workspace) = tw.workspace.upgrade() {
-            let text = text.to_string();
-            cx.update(|cx| {
-                workspace.update(cx, |workspace, cx| {
-                    if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
-                        if let Some(thread) = panel.read(cx).active_agent_thread(cx) {
-                            log::info!("zrc: injecting prompt into thread for {project_name}");
-                            let content_block: agent_client_protocol::ContentBlock = text.into();
-                            thread.update(cx, |thread, cx| {
-                                let fut = thread.send(vec![content_block], cx);
-                                smol::spawn(async move {
-                                    if let Err(e) = fut.await {
-                                        log::warn!("zrc: failed to inject prompt: {e}");
-                                    }
-                                }).detach();
-                            });
-                        }
+    // Find matching workspace; fall back to first available if project_name is empty
+    let target = if project_name.is_empty() {
+        workspaces.iter().find(|tw| tw.workspace.upgrade().is_some())
+    } else {
+        workspaces
+            .iter()
+            .find(|tw| tw.project_name == project_name)
+            .or_else(|| {
+                log::warn!(
+                    "zrc: no workspace named '{}', falling back to first available",
+                    project_name
+                );
+                workspaces.iter().find(|tw| tw.workspace.upgrade().is_some())
+            })
+    };
+
+    let Some(tw) = target else {
+        log::warn!("zrc: no workspace available for prompt injection");
+        return;
+    };
+
+    if let Some(workspace) = tw.workspace.upgrade() {
+        let text = text.to_string();
+        let proj = tw.project_name.clone();
+        cx.update(|cx| {
+            workspace.update(cx, |workspace, cx| {
+                if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
+                    if let Some(thread) = panel.read(cx).active_agent_thread(cx) {
+                        log::info!("zrc: injecting prompt into thread for {proj}");
+                        let content_block: agent_client_protocol::ContentBlock = text.into();
+                        thread.update(cx, |thread, cx| {
+                            let fut = thread.send(vec![content_block], cx);
+                            smol::spawn(async move {
+                                if let Err(e) = fut.await {
+                                    log::warn!("zrc: failed to inject prompt: {e}");
+                                }
+                            })
+                            .detach();
+                        });
                     }
-                });
+                }
             });
-            return;
-        }
+        });
     }
-    log::warn!("zrc: no matching workspace found for project '{project_name}'");
 }
 
 #[derive(Default)]
