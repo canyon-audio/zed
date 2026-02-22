@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use workspace::Workspace;
 
-const DEFAULT_RELAY_URL: &str = "ws://127.0.0.1:9090";
+const DEFAULT_RELAY_URL: &str = "wss://zrc-relay.fly.dev";
 const CREDENTIAL_URL: &str = "zrc://pairing";
 
 struct ZrcTapGlobal {
