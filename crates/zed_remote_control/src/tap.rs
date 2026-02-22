@@ -1,42 +1,130 @@
 use crate::protocol::{EntryData, RelayCommand, TapEvent};
-use crate::transport::RelayTransport;
+use crate::status_bar::ZrcStatusItem;
+use crate::transport::{PairingStatus, RelayTransport, StoredCredentials};
 use acp_thread::{AcpThread, AcpThreadEvent, AgentThreadEntry, AssistantMessageChunk};
 use agent_ui::{AgentPanel, AgentPanelEvent};
+use base64::{engine::general_purpose::STANDARD as B64, Engine};
+use credentials_provider::CredentialsProvider;
 use futures::channel::mpsc;
 use futures::StreamExt;
-use gpui::{App, AsyncApp, Context, Entity, Global, Subscription};
+use gpui::{App, AppContext, AsyncApp, Context, Entity, Global, Subscription, WeakEntity};
+use gpui_tokio::Tokio;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use workspace::Workspace;
 
 const DEFAULT_RELAY_URL: &str = "ws://127.0.0.1:9090";
+const CREDENTIAL_URL: &str = "zrc://pairing";
 
 struct ZrcTapGlobal {
     _event_tx: mpsc::UnboundedSender<TapEvent>,
+    workspaces: Arc<Mutex<Vec<TrackedWorkspace>>>,
+    status_rx: Mutex<Option<mpsc::UnboundedReceiver<PairingStatus>>>,
 }
 
 impl Global for ZrcTapGlobal {}
+
+struct TrackedWorkspace {
+    project_name: String,
+    workspace: WeakEntity<Workspace>,
+}
 
 pub fn init(cx: &mut App) {
     let relay_url =
         std::env::var("ZRC_RELAY_URL").unwrap_or_else(|_| DEFAULT_RELAY_URL.to_string());
 
-    match RelayTransport::connect(&relay_url, cx) {
+    // Load stored credentials and start transport asynchronously
+    let relay_url_clone = relay_url.clone();
+    cx.spawn(async move |cx: &mut AsyncApp| {
+        // Try to load existing pairing credentials from keychain
+        let stored = load_credentials(cx).await;
+
+        cx.update(|cx| {
+            start_transport(&relay_url_clone, stored, cx);
+        });
+    })
+    .detach();
+}
+
+async fn load_credentials(cx: &AsyncApp) -> Option<StoredCredentials> {
+    let provider = cx.update(|cx| <dyn CredentialsProvider>::global(cx));
+    let result = provider.read_credentials(CREDENTIAL_URL, cx).await;
+    match result {
+        Ok(Some((pairing_id, key_bytes))) => {
+            log::info!("zrc: loaded stored pairing credentials for {pairing_id}");
+            Some(StoredCredentials {
+                pairing_id,
+                symmetric_key_b64: B64.encode(&key_bytes),
+            })
+        }
+        Ok(None) => {
+            log::info!("zrc: no stored pairing credentials found");
+            None
+        }
+        Err(e) => {
+            log::warn!("zrc: failed to load credentials: {e}");
+            None
+        }
+    }
+}
+
+fn start_transport(relay_url: &str, stored: Option<StoredCredentials>, cx: &mut App) {
+    match RelayTransport::connect(relay_url, stored, cx) {
         Ok(transport) => {
             log::info!("zrc: tap initialized, connecting to {relay_url}");
 
             let event_tx = transport.event_tx.clone();
+            let workspaces = Arc::new(Mutex::new(Vec::<TrackedWorkspace>::new()));
+
+            // Bridge tokio watch channel → futures mpsc for GPUI consumption
+            let (status_bridge_tx, status_bridge_rx) = mpsc::unbounded::<PairingStatus>();
+            let mut status_rx = transport.status_rx;
+            Tokio::spawn(cx, async move {
+                while status_rx.changed().await.is_ok() {
+                    let status = status_rx.borrow().clone();
+                    if status_bridge_tx.unbounded_send(status).is_err() {
+                        break;
+                    }
+                }
+            })
+            .detach();
+
             cx.set_global(ZrcTapGlobal {
                 _event_tx: transport.event_tx,
+                workspaces: workspaces.clone(),
+                status_rx: Mutex::new(Some(status_bridge_rx)),
             });
 
             // Handle inbound commands from relay
             spawn_inbound_handler(transport.command_rx, cx);
 
+            // Handle peer reconnect — resync current thread state to mobile
+            spawn_resync_handler(transport.peer_connected_rx, event_tx.clone(), cx);
+
+            // Handle credential saves
+            spawn_credential_saver(transport.credential_save_rx, cx);
+
             // Observe all new Workspace instances to find AgentPanels
-            cx.observe_new::<Workspace>(move |workspace, _window, cx| {
+            let workspaces2 = workspaces.clone();
+            cx.observe_new::<Workspace>(move |workspace, window, cx| {
                 let event_tx = event_tx.clone();
-                setup_workspace_tap(workspace, event_tx, cx);
+                let workspaces = workspaces2.clone();
+                setup_workspace_tap(workspace, event_tx, workspaces, cx);
+
+                // Register status bar item (first workspace only)
+                let window = match window {
+                    Some(w) => w,
+                    None => return,
+                };
+                if let Some(status_rx) = cx
+                    .try_global::<ZrcTapGlobal>()
+                    .and_then(|g| g.status_rx.lock().unwrap().take())
+                {
+                    let item = cx.new(|cx| ZrcStatusItem::new(status_rx, cx));
+                    workspace.status_bar().update(cx, |bar, cx| {
+                        bar.add_left_item(item, window, cx);
+                    });
+                }
             })
             .detach();
         }
@@ -46,13 +134,55 @@ pub fn init(cx: &mut App) {
     }
 }
 
+fn spawn_credential_saver(
+    mut cred_rx: mpsc::UnboundedReceiver<StoredCredentials>,
+    cx: &App,
+) {
+    cx.spawn(async move |cx: &mut AsyncApp| {
+        while let Some(creds) = cred_rx.next().await {
+            let provider = cx.update(|cx| <dyn CredentialsProvider>::global(cx));
+            let key_bytes = match B64.decode(&creds.symmetric_key_b64) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            match provider
+                .write_credentials(CREDENTIAL_URL, &creds.pairing_id, &key_bytes, cx)
+                .await
+            {
+                Ok(()) => {
+                    log::info!("zrc: saved pairing credentials for {}", creds.pairing_id);
+                }
+                Err(e) => {
+                    log::warn!("zrc: failed to save credentials: {e}");
+                }
+            }
+        }
+    })
+    .detach();
+}
+
 /// Set up tapping for a workspace.
 fn setup_workspace_tap(
     workspace: &mut Workspace,
     event_tx: mpsc::UnboundedSender<TapEvent>,
+    workspaces: Arc<Mutex<Vec<TrackedWorkspace>>>,
     cx: &mut Context<Workspace>,
 ) {
     let tracked = Arc::new(Mutex::new(TrackedState::default()));
+
+    // Register this workspace for prompt injection
+    let project_name = workspace
+        .project()
+        .read(cx)
+        .visible_worktrees(cx)
+        .next()
+        .map(|wt| wt.read(cx).root_name_str().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    workspaces.lock().unwrap().push(TrackedWorkspace {
+        project_name,
+        workspace: cx.entity().downgrade(),
+    });
 
     // If AgentPanel already exists, observe it now
     if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
@@ -248,13 +378,68 @@ fn serialize_entry(entry: &AgentThreadEntry, cx: &App) -> EntryData {
     }
 }
 
+fn spawn_resync_handler(
+    mut peer_connected_rx: mpsc::UnboundedReceiver<()>,
+    event_tx: mpsc::UnboundedSender<TapEvent>,
+    cx: &App,
+) {
+    cx.spawn(async move |cx: &mut AsyncApp| {
+        while peer_connected_rx.next().await.is_some() {
+            log::info!("zrc: peer reconnected, resyncing current thread state");
+            let mut event_tx = event_tx.clone();
+            cx.update(|cx| {
+                let workspaces: Option<Vec<TrackedWorkspace>> = cx
+                    .try_global::<ZrcTapGlobal>()
+                    .map(|g| g.workspaces.lock().unwrap().clone());
+                let Some(workspaces) = workspaces else { return };
+
+                for tw in &workspaces {
+                    let Some(workspace) = tw.workspace.upgrade() else { continue };
+                    let workspace = workspace.read(cx);
+                    let Some(panel) = workspace.panel::<AgentPanel>(cx) else { continue };
+                    let Some(thread) = panel.read(cx).active_agent_thread(cx) else { continue };
+
+                    let thread = thread.read(cx);
+                    let session_id = thread.session_id().to_string();
+                    let project_name = tw.project_name.clone();
+
+                    log::info!("zrc: resyncing thread {session_id} ({} entries)", thread.entries().len());
+
+                    let _ = event_tx.unbounded_send(TapEvent::ThreadOpened {
+                        project: project_name.clone(),
+                        thread_id: session_id.clone(),
+                    });
+
+                    for (idx, entry) in thread.entries().iter().enumerate() {
+                        let _ = event_tx.unbounded_send(TapEvent::EntryNew {
+                            project: project_name.clone(),
+                            thread_id: session_id.clone(),
+                            index: idx,
+                            entry: serialize_entry(entry, cx),
+                        });
+                    }
+
+                    if !thread.title().is_empty() {
+                        let _ = event_tx.unbounded_send(TapEvent::TitleChanged {
+                            project: project_name.clone(),
+                            thread_id: session_id.clone(),
+                            title: thread.title().to_string(),
+                        });
+                    }
+                }
+            });
+        }
+    })
+    .detach();
+}
+
 fn spawn_inbound_handler(mut command_rx: mpsc::UnboundedReceiver<RelayCommand>, cx: &App) {
-    cx.spawn(async move |_cx: &mut AsyncApp| {
+    cx.spawn(async move |cx: &mut AsyncApp| {
         while let Some(cmd) = command_rx.next().await {
             match cmd {
                 RelayCommand::Prompt { project, text } => {
                     log::info!("zrc: received prompt for project {project}: {text}");
-                    inject_prompt(&project, &text);
+                    inject_prompt(&project, &text, cx);
                 }
             }
         }
@@ -262,12 +447,48 @@ fn spawn_inbound_handler(mut command_rx: mpsc::UnboundedReceiver<RelayCommand>, 
     .detach();
 }
 
-fn inject_prompt(project_name: &str, text: &str) {
-    // TODO: Find the workspace with a matching project, get its AgentPanel,
-    // get the active AcpThread, and call thread.send() to inject the prompt.
-    log::info!(
-        "zrc: inject_prompt for {project_name}: {text} (not yet implemented)"
-    );
+fn inject_prompt(project_name: &str, text: &str, cx: &mut AsyncApp) {
+    let workspaces: Option<Vec<TrackedWorkspace>> = cx.update(|cx| {
+        cx.try_global::<ZrcTapGlobal>()
+            .map(|g| g.workspaces.lock().unwrap().clone())
+    });
+
+    let workspaces = match workspaces {
+        Some(ws) => ws,
+        None => {
+            log::warn!("zrc: cannot inject prompt — no ZrcTapGlobal");
+            return;
+        }
+    };
+
+    for tw in &workspaces {
+        if tw.project_name != project_name {
+            continue;
+        }
+        if let Some(workspace) = tw.workspace.upgrade() {
+            let text = text.to_string();
+            cx.update(|cx| {
+                workspace.update(cx, |workspace, cx| {
+                    if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
+                        if let Some(thread) = panel.read(cx).active_agent_thread(cx) {
+                            log::info!("zrc: injecting prompt into thread for {project_name}");
+                            let content_block: agent_client_protocol::ContentBlock = text.into();
+                            thread.update(cx, |thread, cx| {
+                                let fut = thread.send(vec![content_block], cx);
+                                smol::spawn(async move {
+                                    if let Err(e) = fut.await {
+                                        log::warn!("zrc: failed to inject prompt: {e}");
+                                    }
+                                }).detach();
+                            });
+                        }
+                    }
+                });
+            });
+            return;
+        }
+    }
+    log::warn!("zrc: no matching workspace found for project '{project_name}'");
 }
 
 #[derive(Default)]
@@ -278,4 +499,13 @@ struct TrackedState {
 struct TrackedThread {
     _project_name: String,
     _subscription: Subscription,
+}
+
+impl Clone for TrackedWorkspace {
+    fn clone(&self) -> Self {
+        Self {
+            project_name: self.project_name.clone(),
+            workspace: self.workspace.clone(),
+        }
+    }
 }

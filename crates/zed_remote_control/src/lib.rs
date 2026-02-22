@@ -1,4 +1,6 @@
+mod crypto;
 mod protocol;
+mod status_bar;
 mod tap;
 mod transport;
 
