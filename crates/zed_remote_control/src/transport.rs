@@ -116,6 +116,11 @@ async fn run_connection_loop(
         Some(SessionKeys::new(creds.pairing_id, key))
     });
 
+    // Track in-progress pairing so we can resume it after a reconnect
+    // instead of starting a fresh pairing with a new join code.
+    let mut pending_pairing_id: Option<String> = None;
+    let mut pending_reconnect_token: Option<String> = None;
+
     loop {
         let _ = status_tx.send(PairingStatus::Connecting);
         log::info!("zrc: connecting to relay at {url}");
@@ -132,11 +137,20 @@ async fn run_connection_loop(
                 log::info!("zrc: connected to relay");
                 let (mut ws_sink, mut ws_source) = ws_stream.split();
 
-                // Phase 1: Handshake (include reconnect_token if we have one)
+                // Phase 1: Handshake
+                // If we have a pending pairing (connection dropped mid-ceremony),
+                // reconnect to it instead of starting fresh.
+                let handshake_pairing_id = session_keys
+                    .as_ref()
+                    .map(|k| k.pairing_id.as_str())
+                    .or(pending_pairing_id.as_deref());
+                let handshake_token = reconnect_token
+                    .as_deref()
+                    .or(pending_reconnect_token.as_deref());
                 let handshake = ClientHandshake::new_zed(
                     &client_id,
-                    session_keys.as_ref().map(|k| k.pairing_id.as_str()),
-                    reconnect_token.as_deref(),
+                    handshake_pairing_id,
+                    handshake_token,
                 );
                 if send_json(&mut ws_sink, &handshake).await.is_err() {
                     continue;
@@ -146,9 +160,19 @@ async fn run_connection_loop(
                 let mut peeked_message: Option<String> = None;
 
                 if session_keys.is_none() {
-                    match run_pairing(&mut ws_sink, &mut ws_source, &status_tx).await {
+                    let was_resuming = pending_pairing_id.is_some();
+                    match run_pairing(
+                        &mut ws_sink,
+                        &mut ws_source,
+                        &status_tx,
+                        pending_pairing_id.take(),
+                    )
+                    .await
+                    {
                         Ok((keys, token)) => {
                             reconnect_token = token;
+                            pending_pairing_id = None;
+                            pending_reconnect_token = None;
                             // Save credentials for reconnection
                             let _ = cred_save_tx
                                 .send(StoredCredentials {
@@ -159,11 +183,30 @@ async fn run_connection_loop(
                                 .await;
                             session_keys = Some(keys);
                         }
-                        Err(e) => {
-                            log::warn!("zrc: pairing failed: {e}");
-                            let _ = status_tx.send(PairingStatus::Failed {
-                                reason: e.to_string(),
-                            });
+                        Err(PairingError::ConnectionLost {
+                            pairing_id,
+                            reconnect_token: token,
+                        }) => {
+                            if was_resuming {
+                                // We were already resuming and it failed again —
+                                // the pairing is gone. Start fresh next time.
+                                log::warn!("zrc: resumed pairing lost again, starting fresh");
+                                pending_pairing_id = None;
+                                pending_reconnect_token = None;
+                            } else {
+                                // Fresh pairing interrupted — save state to resume
+                                log::info!("zrc: connection lost during pairing, will resume");
+                                pending_pairing_id = Some(pairing_id);
+                                pending_reconnect_token = token;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                            continue;
+                        }
+                        Err(PairingError::Failed(reason)) => {
+                            log::warn!("zrc: pairing failed: {reason}");
+                            pending_pairing_id = None;
+                            pending_reconnect_token = None;
+                            let _ = status_tx.send(PairingStatus::Failed { reason });
                             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                             continue;
                         }
@@ -247,50 +290,78 @@ async fn run_connection_loop(
     }
 }
 
+/// Pairing error — distinguishes resumable connection loss from real failures.
+enum PairingError {
+    /// Connection dropped mid-pairing. Contains state needed to resume.
+    ConnectionLost {
+        pairing_id: String,
+        reconnect_token: Option<String>,
+    },
+    /// Pairing actually failed (rejected, invalid key, etc.)
+    Failed(String),
+}
+
 /// Run the pairing ceremony. Returns (SessionKeys, reconnect_token) on success.
 async fn run_pairing<S, R>(
     ws_sink: &mut S,
     ws_source: &mut R,
     status_tx: &watch::Sender<PairingStatus>,
-) -> Result<(SessionKeys, Option<String>)>
+    resume_pairing_id: Option<String>,
+) -> std::result::Result<(SessionKeys, Option<String>), PairingError>
 where
     S: futures::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
     R: futures::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
 {
-    // 1. Send PairingInit
-    send_json(ws_sink, &PairingInit::default()).await?;
+    // If resuming a previous pairing, skip pairing.init — the relay already
+    // has our pairing and we reconnected with the same pairing_id in the handshake.
+    // We just need to wait for the mobile to join/continue.
+    let (pairing_id, init_reconnect_token) = if let Some(pid) = resume_pairing_id {
+        log::info!("zrc: resuming pairing {pid} after reconnect");
+        // We don't have the join code anymore but the relay still has the pairing.
+        // The status bar will show "connecting..." until mobile joins.
+        (pid, None)
+    } else {
+        // 1. Send PairingInit
+        send_json(ws_sink, &PairingInit::default())
+            .await
+            .map_err(|e| PairingError::Failed(e.to_string()))?;
 
-    // 2. Wait for PairingInitResult
-    let (pairing_id, join_code, init_reconnect_token) = loop {
-        match recv_relay_message(ws_source).await? {
-            RelayMessage::PairingInitResult(result) => {
-                break (result.pairing_id, result.join_code, result.reconnect_token);
+        // 2. Wait for PairingInitResult
+        let (pid, join_code, token) = loop {
+            match recv_relay_message(ws_source).await {
+                Ok(RelayMessage::PairingInitResult(result)) => {
+                    break (result.pairing_id, result.join_code, result.reconnect_token);
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    return Err(PairingError::Failed("connection lost before init_result".into()));
+                }
             }
-            _ => {}
-        }
+        };
+        log::info!("zrc: join code = {join_code}, pairing_id = {pid}");
+        let _ = status_tx.send(PairingStatus::WaitingForMobile {
+            join_code: join_code.clone(),
+        });
+        (pid, token)
     };
-    log::info!("zrc: join code = {join_code}, pairing_id = {pairing_id}");
-    let _ = status_tx.send(PairingStatus::WaitingForMobile {
-        join_code: join_code.clone(),
-    });
 
     // 3. Generate our keypair
     let keypair = KeyPair::generate();
 
     // 4. Wait for mobile's PairingKeyExchange, then send ours and derive keys
     let (symmetric_key, sas_code) = loop {
-        match recv_relay_message(ws_source).await? {
-            RelayMessage::PairingKeyExchange(kx) => {
+        match recv_relay_message(ws_source).await {
+            Ok(RelayMessage::PairingKeyExchange(kx)) => {
                 let _ = status_tx.send(PairingStatus::KeyExchange);
 
                 let their_pk_bytes = B64
                     .decode(&kx.public_key)
-                    .map_err(|e| anyhow::anyhow!("invalid public key base64: {e}"))?;
+                    .map_err(|e| PairingError::Failed(format!("invalid public key base64: {e}")))?;
                 if their_pk_bytes.len() != 32 {
-                    return Err(anyhow::anyhow!(
+                    return Err(PairingError::Failed(format!(
                         "invalid public key length: {}",
                         their_pk_bytes.len()
-                    ));
+                    )));
                 }
                 let mut pk_arr = [0u8; 32];
                 pk_arr.copy_from_slice(&their_pk_bytes);
@@ -305,17 +376,31 @@ where
                     ws_sink,
                     &PairingKeyExchange::new(&pairing_id, &keypair.public_key_base64()),
                 )
-                .await?;
+                .await
+                .map_err(|_| PairingError::ConnectionLost {
+                    pairing_id: pairing_id.clone(),
+                    reconnect_token: init_reconnect_token.clone(),
+                })?;
 
                 break (sym_key, sas);
             }
-            RelayMessage::PeerConnected(_) => {
+            Ok(RelayMessage::PeerConnected(_)) => {
                 log::info!("zrc: mobile connected, waiting for key exchange");
             }
-            RelayMessage::PairingReject(reject) => {
-                return Err(anyhow::anyhow!("pairing rejected: {}", reject.reason));
+            Ok(RelayMessage::PairingReject(reject)) => {
+                return Err(PairingError::Failed(format!(
+                    "pairing rejected: {}",
+                    reject.reason
+                )));
             }
-            _ => {}
+            Ok(_) => {}
+            Err(_) => {
+                // Connection lost while waiting for mobile
+                return Err(PairingError::ConnectionLost {
+                    pairing_id,
+                    reconnect_token: init_reconnect_token,
+                });
+            }
         }
     };
 
@@ -326,19 +411,33 @@ where
     });
 
     // Auto-confirm for now (later: wait for user confirmation via UI)
-    send_json(ws_sink, &PairingConfirm::new(&pairing_id)).await?;
+    send_json(ws_sink, &PairingConfirm::new(&pairing_id))
+        .await
+        .map_err(|e| PairingError::ConnectionLost {
+            pairing_id: pairing_id.clone(),
+            reconnect_token: init_reconnect_token.clone(),
+        })?;
 
     // 6. Wait for PairingComplete
     loop {
-        match recv_relay_message(ws_source).await? {
-            RelayMessage::PairingComplete(_) => {
+        match recv_relay_message(ws_source).await {
+            Ok(RelayMessage::PairingComplete(_)) => {
                 log::info!("zrc: pairing complete! pairing_id={pairing_id}");
                 return Ok((SessionKeys::new(pairing_id, symmetric_key), init_reconnect_token));
             }
-            RelayMessage::PairingReject(reject) => {
-                return Err(anyhow::anyhow!("pairing rejected: {}", reject.reason));
+            Ok(RelayMessage::PairingReject(reject)) => {
+                return Err(PairingError::Failed(format!(
+                    "pairing rejected: {}",
+                    reject.reason
+                )));
             }
-            _ => {}
+            Ok(_) => {}
+            Err(_) => {
+                return Err(PairingError::ConnectionLost {
+                    pairing_id,
+                    reconnect_token: init_reconnect_token,
+                });
+            }
         }
     }
 }
