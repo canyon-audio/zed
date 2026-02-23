@@ -42,6 +42,7 @@ impl Render for ZrcStatusItem {
             PairingStatus::WaitingForMobile { join_code } => {
                 (format!("ZRC: {join_code}"), Color::Accent)
             }
+            PairingStatus::WaitingForPeer => ("ZRC: waiting...".into(), Color::Accent),
             PairingStatus::KeyExchange => ("ZRC: pairing...".into(), Color::Warning),
             PairingStatus::VerifySas { sas_code } => {
                 (format!("ZRC: SAS {sas_code}"), Color::Warning)

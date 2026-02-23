@@ -82,6 +82,36 @@ pub fn derive_sas_code(shared: &SharedSecret) -> String {
     format!("{:06}", val % 1_000_000)
 }
 
+/// Generate a random 32-byte symmetric key for PSK pairing.
+pub fn generate_symmetric_key() -> [u8; 32] {
+    use rand::RngCore;
+    let mut key = [0u8; 32];
+    rand::rng().fill_bytes(&mut key);
+    key
+}
+
+/// Derive a stable pairing ID from a symmetric key using BLAKE2b.
+///
+/// Uses BLAKE2b keyed MAC with key=b"zrc-pair", 16-byte output,
+/// formatted as a UUID-style hex string.
+pub fn derive_pairing_id(symmetric_key: &[u8; 32]) -> String {
+    use blake2::digest::Mac;
+    type Blake2bMac128 = blake2::Blake2bMac<blake2::digest::consts::U16>;
+    let mut mac =
+        Blake2bMac128::new_from_slice(b"zrc-pair").expect("key length is valid for Blake2b");
+    Mac::update(&mut mac, symmetric_key);
+    let result = mac.finalize();
+    let bytes = result.into_bytes();
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0], bytes[1], bytes[2], bytes[3],
+        bytes[4], bytes[5],
+        bytes[6], bytes[7],
+        bytes[8], bytes[9],
+        bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+    )
+}
+
 /// Build AAD bytes from envelope metadata: pairing_id || sender || sequence (LE u64).
 pub fn build_aad(pairing_id: &str, sender: &str, sequence: u64) -> Vec<u8> {
     let mut aad = Vec::with_capacity(pairing_id.len() + sender.len() + 8);
@@ -405,6 +435,38 @@ mod tests {
         assert_eq!(sk.next_sequence(), 1);
         assert_eq!(sk.next_sequence(), 2);
         assert_eq!(sk.next_sequence(), 3);
+    }
+
+    #[test]
+    fn test_generate_symmetric_key() {
+        let key1 = generate_symmetric_key();
+        let key2 = generate_symmetric_key();
+        assert_ne!(key1, key2, "each key should be unique");
+        assert_eq!(key1.len(), 32);
+    }
+
+    #[test]
+    fn test_derive_pairing_id_deterministic() {
+        let key = hex_to_bytes32(EXPECTED_SYM_KEY_HEX);
+        let id1 = derive_pairing_id(&key);
+        let id2 = derive_pairing_id(&key);
+        assert_eq!(id1, id2, "same key must produce same pairing_id");
+        // Should look like a UUID
+        assert_eq!(id1.len(), 36);
+        assert_eq!(&id1[8..9], "-");
+        assert_eq!(&id1[13..14], "-");
+    }
+
+    #[test]
+    fn test_derive_pairing_id_different_keys() {
+        let key1 = hex_to_bytes32(EXPECTED_SYM_KEY_HEX);
+        let mut key2 = key1;
+        key2[0] ^= 0xff;
+        assert_ne!(
+            derive_pairing_id(&key1),
+            derive_pairing_id(&key2),
+            "different keys must produce different pairing_ids"
+        );
     }
 
     #[test]

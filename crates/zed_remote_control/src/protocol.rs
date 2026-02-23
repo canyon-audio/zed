@@ -108,6 +108,8 @@ pub struct ClientHandshake {
     pub pairing_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reconnect_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pairing_mode: Option<String>,
 }
 
 impl ClientHandshake {
@@ -122,6 +124,22 @@ impl ClientHandshake {
             client_id: client_id.into(),
             pairing_id: pairing_id.map(Into::into),
             reconnect_token: reconnect_token.map(Into::into),
+            pairing_mode: None,
+        }
+    }
+
+    pub fn new_zed_psk(
+        client_id: &str,
+        pairing_id: &str,
+        reconnect_token: Option<&str>,
+    ) -> Self {
+        Self {
+            msg_type: "handshake".into(),
+            client_type: "zed".into(),
+            client_id: client_id.into(),
+            pairing_id: Some(pairing_id.into()),
+            reconnect_token: reconnect_token.map(Into::into),
+            pairing_mode: Some("psk".into()),
         }
     }
 }
@@ -224,6 +242,15 @@ pub struct PeerDisconnected {
     pub peer_type: String,
 }
 
+/// Relay confirms PSK pairing registration (first client to arrive).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PskRegistered {
+    #[serde(rename = "type")]
+    pub msg_type: String,
+    pub pairing_id: String,
+    pub reconnect_token: String,
+}
+
 /// Opaque encrypted message. Relay routes by pairing_id but cannot read payload.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EncryptedEnvelope {
@@ -297,6 +324,7 @@ pub enum RelayMessage {
     PairingKeyExchange(PairingKeyExchange),
     PairingComplete(PairingComplete),
     PairingReject(PairingReject),
+    PskRegistered(PskRegistered),
     PeerConnected(PeerConnected),
     PeerDisconnected(PeerDisconnected),
     Encrypted(EncryptedEnvelope),
@@ -314,6 +342,7 @@ impl RelayMessage {
             "pairing.key_exchange" => Ok(Self::PairingKeyExchange(serde_json::from_value(v)?)),
             "pairing.complete" => Ok(Self::PairingComplete(serde_json::from_value(v)?)),
             "pairing.reject" => Ok(Self::PairingReject(serde_json::from_value(v)?)),
+            "psk.registered" => Ok(Self::PskRegistered(serde_json::from_value(v)?)),
             "peer.connected" => Ok(Self::PeerConnected(serde_json::from_value(v)?)),
             "peer.disconnected" => Ok(Self::PeerDisconnected(serde_json::from_value(v)?)),
             "encrypted" => Ok(Self::Encrypted(serde_json::from_value(v)?)),
@@ -580,6 +609,35 @@ mod tests {
         match msg {
             RelayMessage::Unknown(t) => assert_eq!(t, ""),
             _ => panic!("should be Unknown"),
+        }
+    }
+
+    #[test]
+    fn test_serialize_client_handshake_psk() {
+        let hs = ClientHandshake::new_zed_psk("client-123", "psk-pid", None);
+        let json = serde_json::to_string(&hs).unwrap();
+        assert!(json.contains(r#""pairing_mode":"psk""#));
+        assert!(json.contains(r#""pairing_id":"psk-pid""#));
+    }
+
+    #[test]
+    fn test_serialize_client_handshake_psk_with_token() {
+        let hs = ClientHandshake::new_zed_psk("client-123", "psk-pid", Some("tok-abc"));
+        let json = serde_json::to_string(&hs).unwrap();
+        assert!(json.contains(r#""pairing_mode":"psk""#));
+        assert!(json.contains(r#""reconnect_token":"tok-abc""#));
+    }
+
+    #[test]
+    fn test_parse_psk_registered() {
+        let json = r#"{"type":"psk.registered","pairing_id":"psk-pid-1","reconnect_token":"tok-123"}"#;
+        let msg = RelayMessage::parse(json).unwrap();
+        match msg {
+            RelayMessage::PskRegistered(r) => {
+                assert_eq!(r.pairing_id, "psk-pid-1");
+                assert_eq!(r.reconnect_token, "tok-123");
+            }
+            _ => panic!("expected PskRegistered"),
         }
     }
 

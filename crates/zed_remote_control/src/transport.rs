@@ -16,6 +16,7 @@ pub enum PairingStatus {
     Disconnected,
     Connecting,
     WaitingForMobile { join_code: String },
+    WaitingForPeer,
     KeyExchange,
     VerifySas { sas_code: String },
     Paired { pairing_id: String, peer_online: bool },
@@ -138,8 +139,8 @@ async fn run_connection_loop(
                 let (mut ws_sink, mut ws_source) = ws_stream.split();
 
                 // Phase 1: Handshake
-                // If we have a pending pairing (connection dropped mid-ceremony),
-                // reconnect to it instead of starting fresh.
+                // Determine if this is a PSK connection, ceremony reconnect, or fresh ceremony.
+                let is_psk = session_keys.is_some() && reconnect_token.is_none();
                 let handshake_pairing_id = session_keys
                     .as_ref()
                     .map(|k| k.pairing_id.as_str())
@@ -147,11 +148,19 @@ async fn run_connection_loop(
                 let handshake_token = reconnect_token
                     .as_deref()
                     .or(pending_reconnect_token.as_deref());
-                let handshake = ClientHandshake::new_zed(
-                    &client_id,
-                    handshake_pairing_id,
-                    handshake_token,
-                );
+                let handshake = if is_psk {
+                    ClientHandshake::new_zed_psk(
+                        &client_id,
+                        handshake_pairing_id.unwrap(),
+                        handshake_token,
+                    )
+                } else {
+                    ClientHandshake::new_zed(
+                        &client_id,
+                        handshake_pairing_id,
+                        handshake_token,
+                    )
+                };
                 if send_json(&mut ws_sink, &handshake).await.is_err() {
                     continue;
                 }
@@ -159,7 +168,34 @@ async fn run_connection_loop(
                 // Phase 2: Pairing or Reconnect
                 let mut peeked_message: Option<String> = None;
 
-                if session_keys.is_none() {
+                if is_psk {
+                    // PSK mode: wait for psk.registered, then optionally pairing.complete
+                    let keys = session_keys.as_ref().unwrap();
+                    log::info!("zrc: PSK connect for pairing {}", keys.pairing_id);
+                    let _ = status_tx.send(PairingStatus::WaitingForPeer);
+
+                    match run_psk_handshake(&mut ws_source, &status_tx, &keys.pairing_id).await {
+                        Ok(token) => {
+                            reconnect_token = Some(token);
+                            // Save credentials now that we have a reconnect token
+                            let _ = cred_save_tx
+                                .send(StoredCredentials {
+                                    pairing_id: keys.pairing_id.clone(),
+                                    symmetric_key_b64: B64.encode(keys.symmetric_key),
+                                    reconnect_token: reconnect_token.clone(),
+                                })
+                                .await;
+                        }
+                        Err(reason) => {
+                            log::warn!("zrc: PSK handshake failed: {reason}");
+                            session_keys = None;
+                            let _ = cred_delete_tx.unbounded_send(());
+                            let _ = status_tx.send(PairingStatus::Failed { reason });
+                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                            continue;
+                        }
+                    }
+                } else if session_keys.is_none() {
                     let was_resuming = pending_pairing_id.is_some();
                     match run_pairing(
                         &mut ws_sink,
@@ -288,6 +324,45 @@ async fn run_connection_loop(
         let _ = status_tx.send(PairingStatus::Disconnected);
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
     }
+}
+
+/// Handle the PSK handshake: wait for psk.registered, then optionally pairing.complete.
+/// Returns the reconnect_token on success, or an error reason.
+async fn run_psk_handshake<R>(
+    ws_source: &mut R,
+    status_tx: &watch::Sender<PairingStatus>,
+    pairing_id: &str,
+) -> std::result::Result<String, String>
+where
+    R: futures::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+{
+    // Wait for psk.registered
+    let token = loop {
+        match recv_relay_message(ws_source).await {
+            Ok(RelayMessage::PskRegistered(reg)) => {
+                log::info!("zrc: PSK registered, token received");
+                break reg.reconnect_token;
+            }
+            Ok(RelayMessage::PairingExpired { .. }) => {
+                return Err("pairing expired on relay".into());
+            }
+            Ok(_) => {}
+            Err(e) => {
+                return Err(format!("connection lost during PSK handshake: {e}"));
+            }
+        }
+    };
+
+    // After psk.registered, we might get pairing.complete immediately (if peer
+    // was already waiting) or we enter the encrypted loop and get it later.
+    // Either way, we have our token and can proceed — the encrypted loop handles
+    // pairing.complete and peer.connected messages already.
+    let _ = status_tx.send(PairingStatus::Paired {
+        pairing_id: pairing_id.to_string(),
+        peer_online: false,
+    });
+
+    Ok(token)
 }
 
 /// Pairing error — distinguishes resumable connection loss from real failures.
@@ -550,6 +625,9 @@ async fn handle_inbound_text(
                     log::warn!("zrc: decryption failed: {e}");
                 }
             }
+        }
+        Ok(RelayMessage::PairingComplete(_)) => {
+            log::info!("zrc: pairing complete (PSK peer arrived)");
         }
         Ok(RelayMessage::PeerConnected(pc)) => {
             log::info!("zrc: peer connected: {}", pc.peer_type);
