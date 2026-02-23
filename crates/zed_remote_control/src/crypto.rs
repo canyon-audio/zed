@@ -470,6 +470,29 @@ mod tests {
     }
 
     #[test]
+    fn test_derive_pairing_id_cross_language_zeros() {
+        // Cross-language vector: all-zeros key → same pairing_id as Python and C++
+        let key = [0u8; 32];
+        assert_eq!(
+            derive_pairing_id(&key),
+            "53774bda-592e-076b-7b87-69e7b8e203d3"
+        );
+    }
+
+    #[test]
+    fn test_derive_pairing_id_cross_language_sequential() {
+        // Cross-language vector: key = 0..31 → same pairing_id as Python and C++
+        let mut key = [0u8; 32];
+        for i in 0..32 {
+            key[i] = i as u8;
+        }
+        assert_eq!(
+            derive_pairing_id(&key),
+            "27bd73db-489a-f0f1-4461-7ff49eee5837"
+        );
+    }
+
+    #[test]
     fn test_full_pipeline_known_vectors() {
         // End-to-end: keypair → ECDH → KDF → SAS → encrypt → decrypt
         let zed_kp = KeyPair::from_secret_bytes(hex_to_bytes32(ZED_SK_HEX));

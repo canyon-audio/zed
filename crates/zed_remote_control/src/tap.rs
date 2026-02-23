@@ -29,6 +29,46 @@ struct TrackedWorkspace {
     workspace: WeakEntity<Workspace>,
 }
 
+/// Generate a new PSK key pair and return the `zrc://pair?key=...&relay=...` URL.
+/// The key is stored as credentials and the transport will use PSK mode on next connect.
+pub fn generate_psk(cx: &mut App) -> String {
+    let key = crate::crypto::generate_symmetric_key();
+    let pairing_id = crate::crypto::derive_pairing_id(&key);
+    let key_b64 = B64.encode(key);
+
+    let relay_url = std::env::var("ZRC_RELAY_URL").unwrap_or_else(|_| DEFAULT_RELAY_URL.to_string());
+
+    // Store credentials so the transport picks them up on next connect
+    let creds = StoredCredentials {
+        pairing_id: pairing_id.clone(),
+        symmetric_key_b64: key_b64.clone(),
+        reconnect_token: None,
+    };
+
+    // Save to keychain via credential provider
+    let creds_clone = creds.clone();
+    cx.spawn(async move |cx: &mut AsyncApp| {
+        let provider = cx.update(|cx| <dyn CredentialsProvider>::global(cx));
+        let payload = match serde_json::to_vec(&creds_clone) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        if let Err(e) = provider
+            .write_credentials(CREDENTIAL_URL, &creds_clone.pairing_id, &payload, cx)
+            .await
+        {
+            log::warn!("zrc: failed to save PSK credentials: {e}");
+        } else {
+            log::info!("zrc: saved PSK credentials for {}", creds_clone.pairing_id);
+        }
+    })
+    .detach();
+
+    let url = format!("zrc://pair?key={}&relay={}", key_b64, relay_url);
+    log::info!("zrc: generated PSK pairing URL: {url}");
+    url
+}
+
 pub fn init(cx: &mut App) {
     let relay_url =
         std::env::var("ZRC_RELAY_URL").unwrap_or_else(|_| DEFAULT_RELAY_URL.to_string());
